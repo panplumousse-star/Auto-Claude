@@ -47,6 +47,7 @@ TOOL_UPDATE_QA_STATUS = "mcp__auto-claude__update_qa_status"
 CONTEXT7_TOOLS = [
     "mcp__context7__resolve-library-id",
     "mcp__context7__get-library-docs",
+    "mcp__context7__query-d",
 ]
 
 # Linear MCP tools for project management (when LINEAR_API_KEY is set)

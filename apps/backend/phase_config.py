@@ -25,7 +25,7 @@ THINKING_BUDGET_MAP: dict[str, int | None] = {
     "low": 1024,
     "medium": 4096,  # Moderate analysis
     "high": 16384,  # Deep thinking for QA review
-    "ultrathink": 65536,  # Maximum reasoning depth
+    "ultrathink": 63990,  # Maximum reasoning depth (under Opus 4.5 64k limit)
 }
 
 # Spec runner phase-specific thinking levels
