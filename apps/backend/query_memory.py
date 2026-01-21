@@ -79,8 +79,88 @@ def output_error(message: str):
     output_json(False, error=message)
 
 
+import time
+import random
+
+# Retry configuration for lock errors
+MAX_RETRIES = 3
+BASE_DELAY_MS = 50  # 50ms base delay
+MAX_DELAY_MS = 500  # 500ms max delay
+
+
+class DatabaseConnection:
+    """Context manager for database connections with retry logic and proper cleanup."""
+
+    def __init__(self, db_path: str, database: str, max_retries: int = MAX_RETRIES):
+        self.db_path = db_path
+        self.database = database
+        self.max_retries = max_retries
+        self.db = None
+        self.conn = None
+        self.error = None
+
+    def __enter__(self):
+        # Try to import kuzu (might be real_ladybug via monkeypatch or native)
+        try:
+            import kuzu
+        except ImportError:
+            import real_ladybug as kuzu
+
+        full_path = Path(self.db_path) / self.database
+        if not full_path.exists():
+            self.error = f"Database not found at {full_path}"
+            return self
+
+        # Retry loop with exponential backoff for lock errors
+        last_error = None
+        for attempt in range(self.max_retries):
+            try:
+                self.db = kuzu.Database(str(full_path))
+                self.conn = kuzu.Connection(self.db)
+                return self  # Success!
+            except Exception as e:
+                last_error = e
+                error_str = str(e).lower()
+                # Only retry on lock errors
+                if "lock" in error_str or "could not set lock" in error_str:
+                    if attempt < self.max_retries - 1:
+                        # Exponential backoff with jitter
+                        delay_ms = min(BASE_DELAY_MS * (2 ** attempt), MAX_DELAY_MS)
+                        jitter = random.randint(0, delay_ms // 2)
+                        time.sleep((delay_ms + jitter) / 1000.0)
+                        # Clean up failed attempt
+                        if self.db is not None:
+                            try:
+                                del self.db
+                            except Exception:
+                                pass
+                            self.db = None
+                        continue
+                # Non-lock error or last attempt, don't retry
+                break
+
+        self.error = str(last_error) if last_error else "Unknown error"
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Always close connection and database
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+        if self.db is not None:
+            try:
+                del self.db  # Force cleanup
+            except Exception:
+                pass
+            self.db = None
+        return False  # Don't suppress exceptions
+
+
 def get_db_connection(db_path: str, database: str):
-    """Get a database connection."""
+    """Get a database connection. DEPRECATED: Use DatabaseConnection context manager instead."""
     try:
         # Try to import kuzu (might be real_ladybug via monkeypatch or native)
         try:
@@ -132,18 +212,21 @@ def cmd_get_status(args):
                 continue
             databases.append(item.name)
 
-    # Try to connect and verify
-    conn, error = get_db_connection(str(db_path), database)
-    connected = conn is not None
-
-    if connected:
-        try:
-            # Test query
-            result = conn.execute("RETURN 1 as test")
-            _ = result.get_as_df()
-        except Exception as e:
-            connected = False
-            error = str(e)
+    # Try to connect and verify using context manager for proper cleanup
+    connected = False
+    error = None
+    with DatabaseConnection(str(db_path), database) as db_conn:
+        if db_conn.error:
+            error = db_conn.error
+        elif db_conn.conn is not None:
+            try:
+                # Test query - use has_next() instead of get_as_df() to avoid pandas dependency
+                result = db_conn.conn.execute("RETURN 1 as test")
+                if result.has_next():
+                    result.get_next()
+                connected = True
+            except Exception as e:
+                error = str(e)
 
     output_json(
         True,
@@ -166,65 +249,68 @@ def cmd_get_memories(args):
         output_error("Neither kuzu nor LadybugDB is installed")
         return
 
-    conn, error = get_db_connection(args.db_path, args.database)
-    if not conn:
-        output_error(error or "Failed to connect to database")
-        return
+    with DatabaseConnection(args.db_path, args.database) as db_conn:
+        if db_conn.error:
+            output_error(db_conn.error)
+            return
+        if not db_conn.conn:
+            output_error("Failed to connect to database")
+            return
 
-    try:
-        limit = args.limit or 20
+        try:
+            limit = args.limit or 20
 
-        # Query episodic nodes with parameterized query
-        query = """
-            MATCH (e:Episodic)
-            RETURN e.uuid as uuid, e.name as name, e.created_at as created_at,
-                   e.content as content, e.source_description as description,
-                   e.group_id as group_id
-            ORDER BY e.created_at DESC
-            LIMIT $limit
-        """
+            # Query episodic nodes with parameterized query
+            query = """
+                MATCH (e:Episodic)
+                RETURN e.uuid as uuid, e.name as name, e.created_at as created_at,
+                       e.content as content, e.source_description as description,
+                       e.group_id as group_id
+                ORDER BY e.created_at DESC
+                LIMIT $limit
+            """
 
-        result = conn.execute(query, parameters={"limit": limit})
+            result = db_conn.conn.execute(query, parameters={"limit": limit})
 
-        # Process results without pandas (iterate through result set directly)
-        memories = []
-        while result.has_next():
-            row = result.get_next()
-            # Row order: uuid, name, created_at, content, description, group_id
-            uuid_val = serialize_value(row[0]) if len(row) > 0 else None
-            name_val = serialize_value(row[1]) if len(row) > 1 else ""
-            created_at_val = serialize_value(row[2]) if len(row) > 2 else None
-            content_val = serialize_value(row[3]) if len(row) > 3 else ""
-            description_val = serialize_value(row[4]) if len(row) > 4 else ""
-            group_id_val = serialize_value(row[5]) if len(row) > 5 else ""
+            # Process results without pandas (iterate through result set directly)
+            memories = []
+            while result.has_next():
+                row = result.get_next()
+                # Row order: uuid, name, created_at, content, description, group_id
+                uuid_val = serialize_value(row[0]) if len(row) > 0 else None
+                name_val = serialize_value(row[1]) if len(row) > 1 else ""
+                created_at_val = serialize_value(row[2]) if len(row) > 2 else None
+                content_val = serialize_value(row[3]) if len(row) > 3 else ""
+                description_val = serialize_value(row[4]) if len(row) > 4 else ""
+                group_id_val = serialize_value(row[5]) if len(row) > 5 else ""
 
-            memory = {
-                "id": uuid_val or name_val or "unknown",
-                "name": name_val or "",
-                "type": infer_episode_type(name_val or "", content_val or ""),
-                "timestamp": created_at_val or datetime.now().isoformat(),
-                "content": content_val or description_val or name_val or "",
-                "description": description_val or "",
-                "group_id": group_id_val or "",
-            }
+                memory = {
+                    "id": uuid_val or name_val or "unknown",
+                    "name": name_val or "",
+                    "type": infer_episode_type(name_val or "", content_val or ""),
+                    "timestamp": created_at_val or datetime.now().isoformat(),
+                    "content": content_val or description_val or name_val or "",
+                    "description": description_val or "",
+                    "group_id": group_id_val or "",
+                }
 
-            # Extract session number if present
-            session_num = extract_session_number(name_val or "")
-            if session_num:
-                memory["session_number"] = session_num
+                # Extract session number if present
+                session_num = extract_session_number(name_val or "")
+                if session_num:
+                    memory["session_number"] = session_num
 
-            memories.append(memory)
+                memories.append(memory)
 
-        output_json(True, data={"memories": memories, "count": len(memories)})
+            output_json(True, data={"memories": memories, "count": len(memories)})
 
-    except Exception as e:
-        # Table might not exist yet
-        if "Episodic" in str(e) and (
-            "not exist" in str(e).lower() or "cannot" in str(e).lower()
-        ):
-            output_json(True, data={"memories": [], "count": 0})
-        else:
-            output_error(f"Query failed: {e}")
+        except Exception as e:
+            # Table might not exist yet
+            if "Episodic" in str(e) and (
+                "not exist" in str(e).lower() or "cannot" in str(e).lower()
+            ):
+                output_json(True, data={"memories": [], "count": 0})
+            else:
+                output_error(f"Query failed: {e}")
 
 
 def cmd_search(args):
@@ -233,73 +319,76 @@ def cmd_search(args):
         output_error("Neither kuzu nor LadybugDB is installed")
         return
 
-    conn, error = get_db_connection(args.db_path, args.database)
-    if not conn:
-        output_error(error or "Failed to connect to database")
-        return
+    with DatabaseConnection(args.db_path, args.database) as db_conn:
+        if db_conn.error:
+            output_error(db_conn.error)
+            return
+        if not db_conn.conn:
+            output_error("Failed to connect to database")
+            return
 
-    try:
-        limit = args.limit or 20
-        search_query = args.query.lower()
+        try:
+            limit = args.limit or 20
+            search_query = args.query.lower()
 
-        # Search in episodic nodes using CONTAINS with parameterized query
-        query = """
-            MATCH (e:Episodic)
-            WHERE toLower(e.name) CONTAINS $search_query
-               OR toLower(e.content) CONTAINS $search_query
-               OR toLower(e.source_description) CONTAINS $search_query
-            RETURN e.uuid as uuid, e.name as name, e.created_at as created_at,
-                   e.content as content, e.source_description as description,
-                   e.group_id as group_id
-            ORDER BY e.created_at DESC
-            LIMIT $limit
-        """
+            # Search in episodic nodes using CONTAINS with parameterized query
+            query = """
+                MATCH (e:Episodic)
+                WHERE toLower(e.name) CONTAINS $search_query
+                   OR toLower(e.content) CONTAINS $search_query
+                   OR toLower(e.source_description) CONTAINS $search_query
+                RETURN e.uuid as uuid, e.name as name, e.created_at as created_at,
+                       e.content as content, e.source_description as description,
+                       e.group_id as group_id
+                ORDER BY e.created_at DESC
+                LIMIT $limit
+            """
 
-        result = conn.execute(
-            query, parameters={"search_query": search_query, "limit": limit}
-        )
+            result = db_conn.conn.execute(
+                query, parameters={"search_query": search_query, "limit": limit}
+            )
 
-        # Process results without pandas
-        memories = []
-        while result.has_next():
-            row = result.get_next()
-            # Row order: uuid, name, created_at, content, description, group_id
-            uuid_val = serialize_value(row[0]) if len(row) > 0 else None
-            name_val = serialize_value(row[1]) if len(row) > 1 else ""
-            created_at_val = serialize_value(row[2]) if len(row) > 2 else None
-            content_val = serialize_value(row[3]) if len(row) > 3 else ""
-            description_val = serialize_value(row[4]) if len(row) > 4 else ""
-            group_id_val = serialize_value(row[5]) if len(row) > 5 else ""
+            # Process results without pandas
+            memories = []
+            while result.has_next():
+                row = result.get_next()
+                # Row order: uuid, name, created_at, content, description, group_id
+                uuid_val = serialize_value(row[0]) if len(row) > 0 else None
+                name_val = serialize_value(row[1]) if len(row) > 1 else ""
+                created_at_val = serialize_value(row[2]) if len(row) > 2 else None
+                content_val = serialize_value(row[3]) if len(row) > 3 else ""
+                description_val = serialize_value(row[4]) if len(row) > 4 else ""
+                group_id_val = serialize_value(row[5]) if len(row) > 5 else ""
 
-            memory = {
-                "id": uuid_val or name_val or "unknown",
-                "name": name_val or "",
-                "type": infer_episode_type(name_val or "", content_val or ""),
-                "timestamp": created_at_val or datetime.now().isoformat(),
-                "content": content_val or description_val or name_val or "",
-                "description": description_val or "",
-                "group_id": group_id_val or "",
-                "score": 1.0,  # Keyword match score
-            }
+                memory = {
+                    "id": uuid_val or name_val or "unknown",
+                    "name": name_val or "",
+                    "type": infer_episode_type(name_val or "", content_val or ""),
+                    "timestamp": created_at_val or datetime.now().isoformat(),
+                    "content": content_val or description_val or name_val or "",
+                    "description": description_val or "",
+                    "group_id": group_id_val or "",
+                    "score": 1.0,  # Keyword match score
+                }
 
-            session_num = extract_session_number(name_val or "")
-            if session_num:
-                memory["session_number"] = session_num
+                session_num = extract_session_number(name_val or "")
+                if session_num:
+                    memory["session_number"] = session_num
 
-            memories.append(memory)
+                memories.append(memory)
 
-        output_json(
-            True,
-            data={"memories": memories, "count": len(memories), "query": args.query},
-        )
+            output_json(
+                True,
+                data={"memories": memories, "count": len(memories), "query": args.query},
+            )
 
-    except Exception as e:
-        if "Episodic" in str(e) and (
-            "not exist" in str(e).lower() or "cannot" in str(e).lower()
-        ):
-            output_json(True, data={"memories": [], "count": 0, "query": args.query})
-        else:
-            output_error(f"Search failed: {e}")
+        except Exception as e:
+            if "Episodic" in str(e) and (
+                "not exist" in str(e).lower() or "cannot" in str(e).lower()
+            ):
+                output_json(True, data={"memories": [], "count": 0, "query": args.query})
+            else:
+                output_error(f"Search failed: {e}")
 
 
 def cmd_semantic_search(args):
@@ -457,56 +546,59 @@ def cmd_get_entities(args):
         output_error("Neither kuzu nor LadybugDB is installed")
         return
 
-    conn, error = get_db_connection(args.db_path, args.database)
-    if not conn:
-        output_error(error or "Failed to connect to database")
-        return
+    with DatabaseConnection(args.db_path, args.database) as db_conn:
+        if db_conn.error:
+            output_error(db_conn.error)
+            return
+        if not db_conn.conn:
+            output_error("Failed to connect to database")
+            return
 
-    try:
-        limit = args.limit or 20
+        try:
+            limit = args.limit or 20
 
-        # Query entity nodes with parameterized query
-        query = """
-            MATCH (e:Entity)
-            RETURN e.uuid as uuid, e.name as name, e.summary as summary,
-                   e.created_at as created_at
-            ORDER BY e.created_at DESC
-            LIMIT $limit
-        """
+            # Query entity nodes with parameterized query
+            query = """
+                MATCH (e:Entity)
+                RETURN e.uuid as uuid, e.name as name, e.summary as summary,
+                       e.created_at as created_at
+                ORDER BY e.created_at DESC
+                LIMIT $limit
+            """
 
-        result = conn.execute(query, parameters={"limit": limit})
+            result = db_conn.conn.execute(query, parameters={"limit": limit})
 
-        # Process results without pandas
-        entities = []
-        while result.has_next():
-            row = result.get_next()
-            # Row order: uuid, name, summary, created_at
-            uuid_val = serialize_value(row[0]) if len(row) > 0 else None
-            name_val = serialize_value(row[1]) if len(row) > 1 else ""
-            summary_val = serialize_value(row[2]) if len(row) > 2 else ""
-            created_at_val = serialize_value(row[3]) if len(row) > 3 else None
+            # Process results without pandas
+            entities = []
+            while result.has_next():
+                row = result.get_next()
+                # Row order: uuid, name, summary, created_at
+                uuid_val = serialize_value(row[0]) if len(row) > 0 else None
+                name_val = serialize_value(row[1]) if len(row) > 1 else ""
+                summary_val = serialize_value(row[2]) if len(row) > 2 else ""
+                created_at_val = serialize_value(row[3]) if len(row) > 3 else None
 
-            if not summary_val:
-                continue
+                if not summary_val:
+                    continue
 
-            entity = {
-                "id": uuid_val or name_val or "unknown",
-                "name": name_val or "",
-                "type": infer_entity_type(name_val or ""),
-                "timestamp": created_at_val or datetime.now().isoformat(),
-                "content": summary_val or "",
-            }
-            entities.append(entity)
+                entity = {
+                    "id": uuid_val or name_val or "unknown",
+                    "name": name_val or "",
+                    "type": infer_entity_type(name_val or ""),
+                    "timestamp": created_at_val or datetime.now().isoformat(),
+                    "content": summary_val or "",
+                }
+                entities.append(entity)
 
-        output_json(True, data={"entities": entities, "count": len(entities)})
+            output_json(True, data={"entities": entities, "count": len(entities)})
 
-    except Exception as e:
-        if "Entity" in str(e) and (
-            "not exist" in str(e).lower() or "cannot" in str(e).lower()
-        ):
-            output_json(True, data={"entities": [], "count": 0})
-        else:
-            output_error(f"Query failed: {e}")
+        except Exception as e:
+            if "Entity" in str(e) and (
+                "not exist" in str(e).lower() or "cannot" in str(e).lower()
+            ):
+                output_json(True, data={"entities": [], "count": 0})
+            else:
+                output_error(f"Query failed: {e}")
 
 
 def cmd_add_episode(args):
@@ -528,6 +620,8 @@ def cmd_add_episode(args):
         output_error("Neither kuzu nor LadybugDB is installed")
         return
 
+    db = None
+    conn = None
     try:
         import uuid as uuid_module
 
@@ -619,6 +713,18 @@ def cmd_add_episode(args):
 
     except Exception as e:
         output_error(f"Failed to add episode: {e}")
+    finally:
+        # Always close connection and database
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if db is not None:
+            try:
+                del db
+            except Exception:
+                pass
 
 
 def infer_episode_type(name: str, content: str = "") -> str:

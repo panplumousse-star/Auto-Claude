@@ -630,9 +630,14 @@ def get_graphiti_status() -> dict:
 
     # Try importing the required Graphiti packages
     try:
-        # Attempt to import the main graphiti_memory module
+        # Attempt to import the main graphiti modules
         import graphiti_core  # noqa: F401
-        from graphiti_core.driver.falkordb_driver import FalkorDriver  # noqa: F401
+
+        # Check for LadybugDB (preferred) or Kuzu driver
+        try:
+            import real_ladybug  # noqa: F401
+        except ImportError:
+            import kuzu  # noqa: F401
 
         # If we got here, packages are importable
         status["available"] = True

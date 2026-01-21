@@ -38,6 +38,10 @@ SDK_ENV_VARS = [
     "API_TIMEOUT_MS",
     # Windows-specific: Git Bash path for Claude Code CLI
     "CLAUDE_CODE_GIT_BASH_PATH",
+    # PATH is required for MCP servers that use npx/npm commands
+    # Without it, the SDK subprocess cannot find executables like npx
+    # This is especially important for nvm-managed Node.js installations
+    "PATH",
 ]
 
 
